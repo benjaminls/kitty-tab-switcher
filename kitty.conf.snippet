@@ -1,0 +1,5 @@
+# MRU tab switcher (inject marker so the kitten always sees an event)
+map ctrl+tab kitten /path/to/tab_switcher.py next
+map ctrl+shift+tab kitten /path/to/tab_switcher.py prev
+map --when-focus-on title:^KTS_SWITCHER$ ctrl+tab send_key tab
+map --when-focus-on title:^KTS_SWITCHER$ ctrl+shift+tab send_key shift+tab

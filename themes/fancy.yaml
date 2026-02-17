@@ -1,0 +1,42 @@
+name: default
+
+border:
+  normal:
+    h: "═"
+    v: "║"
+    tl: "╔"
+    tr: "╗"
+    bl: "╚"
+    br: "╝"
+  selected:
+    h: "═"
+    v: "║"
+    tl: "╔"
+    tr: "╗"
+    bl: "╚"
+    br: "╝"
+
+text:
+  title_align: center 
+  title_padding: 1
+  title_invert_selected: true
+
+wrap:
+  title: truncate
+  preview: truncate
+  ellipsis: "..."
+
+layout:
+  align: center
+  vertical_align: center
+  gap: 2
+
+size:
+  preview_rows: 12
+  min_preview_rows: 6
+  min_preview_cols: 24
+  card_min_width: 7
+  card_min_height: 3
+
+preview:
+  color_mode: both
