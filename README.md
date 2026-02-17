@@ -2,6 +2,8 @@
 
 A fast, Mac/Orion-style tab switcher kitten for kitty. It opens an overlay in the current terminal window, shows a title and a downsampled text preview, and uses MRU ordering (last used tab at top of stack). Release Ctrl to commit the switch.
 
+![](docs/img/tab_preview_text.png)
+
 ## Install
 
 Copy `tab_switcher.py` into your kitty config directory (or keep it in this repo and reference it by path).
