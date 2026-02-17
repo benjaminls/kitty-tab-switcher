@@ -39,6 +39,9 @@ SWITCHER_TITLE = "KTS_SWITCHER"
 DEBUG_ENV = "KTS_DEBUG"
 DEBUG_PATH_ENV = "KTS_DEBUG_PATH"
 DEFAULT_DEBUG_PATH = os.path.expanduser("~/.cache/kitty-tab-switcher-debug.log")
+PROFILE_ENV = "KTS_PROFILE"
+PROFILE_PATH_ENV = "KTS_PROFILE_PATH"
+PROFILE_SAMPLE_MS_ENV = "KTS_PROFILE_SAMPLE_MS"
 
 CSI = "\x1b["
 KEYBOARD_MODE_PUSH = f"{CSI}>1u"
@@ -223,12 +226,14 @@ class RawSwitcher:
         remote_control: Callable[..., Any],
         command_server: "CommandServer | None",
         theme: Theme,
+        profiler: SectionProfiler,
     ) -> None:
         self.tabs = tabs
         self.os_window_id = os_window_id
         self.remote_control = remote_control
         self.command_server = command_server
         self.theme = theme
+        self.profiler = profiler
         self.state = StateStore(os_window_id)
         self.preview_state = PreviewStore(os_window_id)
         self.preview_cache: dict[int, list[str]] = {}
@@ -269,6 +274,17 @@ class RawSwitcher:
         self.marker_sent = False
         self.initial_mods_checked = False
         self.initial_ctrl_down = False
+        self.preview_refresh_secs = max(0.05, float(self.theme.preview_refresh_ms) / 1000.0)
+        self.preview_fetch_budget_secs = max(0.005, float(self.theme.preview_fetch_budget_ms) / 1000.0)
+        self.mod_poll_fast_secs = max(0.005, float(self.theme.mod_poll_fast_ms) / 1000.0)
+        self.mod_poll_idle_secs = max(self.mod_poll_fast_secs, float(self.theme.mod_poll_idle_ms) / 1000.0)
+        self.last_mod_poll = 0.0
+        self.last_mod_poll_value: int | None = None
+        self.last_preview_fetch = 0.0
+        self.preview_dirty = False
+        self.last_preview_save = 0.0
+        self.preview_save_interval = 0.5
+        self.render_cache: dict[tuple[int, int, int, str, int], list[str]] = {}
 
     def run(self) -> None:
         log("switcher.run start", tabs=len(self.tabs), selected=self.selected_index)
@@ -282,14 +298,22 @@ class RawSwitcher:
             rlist = [fd]
             if self.command_server is not None:
                 rlist.append(self.command_server.fileno())
-            r, _, _ = select.select(rlist, [], [], 0.05)
+            idle_for = time.time() - self.last_input_time
+            timeout = self.mod_poll_fast_secs if idle_for < 0.3 else self.mod_poll_idle_secs
+            with self.profiler.scoped("loop.select_wait"):
+                r, _, _ = select.select(rlist, [], [], timeout)
             if not r:
                 if self._drain_preview_queue():
                     self.draw()
-                if self.mod_query is not None and self.ctrl_mask is not None:
-                    mods = self.mod_query()
-                    log("mods_poll", mods=mods)
+                now = time.time()
+                if self.mod_query is not None and self.ctrl_mask is not None and (now - self.last_mod_poll) >= timeout:
+                    self.last_mod_poll = now
+                    with self.profiler.scoped("loop.mod_poll"):
+                        mods = self.mod_query()
                     if mods is not None:
+                        if mods != self.last_mod_poll_value:
+                            log("mods_poll", mods=mods)
+                            self.last_mod_poll_value = mods
                         if ctrl_is_down(mods, self.ctrl_mask):
                             self.poll_ctrl_seen = True
                             self.ctrl_down = True
@@ -332,80 +356,82 @@ class RawSwitcher:
                     self.draw(force=True)
             if fd not in r:
                 continue
-            ev = read_key(fd)
+            with self.profiler.scoped("loop.read_key"):
+                ev = read_key(fd)
             if ev is None:
                 continue
             self.any_key_event = True
             self.last_input_time = time.time()
             try:
-                log("key", code=ev.key_code, mods=ev.mods, event=ev.event_type)
-                log("key_state", ctrl_down=self.ctrl_down, saw_tab=self.saw_tab_event)
-                if ev.key_code == MARKER_KEY_CODE and ev.event_type == 1:
-                    self.marker_seen = True
-                    self.ctrl_down = True
-                    self.ctrl_seen = True
-                    log("marker_seen")
-                    continue
-                if ev.key_code == MARKER_KEY_CODE and ev.event_type == 3:
-                    self.ctrl_down = False
-                    log("marker_release")
-                    continue
-                if ev.key_code in CTRL_KEY_CODES and ev.event_type == 1:
-                    self.ctrl_down = True
-                    self.ctrl_seen = True
-                if ev.key_code in CTRL_KEY_CODES and ev.event_type == 3:
-                    self.ctrl_down = False
-                if ev.key_code in CTRL_KEY_CODES and ev.event_type == 3:
-                    if self._should_commit_on_ctrl_release():
-                        log("ctrl_release_commit")
+                with self.profiler.scoped("event.handle"):
+                    log("key", code=ev.key_code, mods=ev.mods, event=ev.event_type)
+                    log("key_state", ctrl_down=self.ctrl_down, saw_tab=self.saw_tab_event)
+                    if ev.key_code == MARKER_KEY_CODE and ev.event_type == 1:
+                        self.marker_seen = True
+                        self.ctrl_down = True
+                        self.ctrl_seen = True
+                        log("marker_seen")
+                        continue
+                    if ev.key_code == MARKER_KEY_CODE and ev.event_type == 3:
+                        self.ctrl_down = False
+                        log("marker_release")
+                        continue
+                    if ev.key_code in CTRL_KEY_CODES and ev.event_type == 1:
+                        self.ctrl_down = True
+                        self.ctrl_seen = True
+                    if ev.key_code in CTRL_KEY_CODES and ev.event_type == 3:
+                        self.ctrl_down = False
+                    if ev.key_code in CTRL_KEY_CODES and ev.event_type == 3:
+                        if self._should_commit_on_ctrl_release():
+                            log("ctrl_release_commit")
+                            log(
+                                "ctrl_release_state",
+                                selected_index=self.selected_index,
+                                selected_tab=self._current_tab_id(),
+                                tabs=[t.id for t in self.tabs],
+                            )
+                            self.commit()
+                            return
+                        log("ctrl_release_ignored", elapsed=time.time() - self.start_time, saw_tab=self.saw_tab_event)
+                    if ev.key_code == ESC_CODE and ev.event_type == 1:
+                        self.cancel()
+                        return
+                    if ev.key_code == TAB_CODE and ev.event_type in (1, 2):
                         log(
-                            "ctrl_release_state",
+                            "tab_key",
+                            event_type=ev.event_type,
+                            mods=ev.mods,
+                            ctrl=ev.ctrl,
+                            shift=ev.shift,
                             selected_index=self.selected_index,
                             selected_tab=self._current_tab_id(),
-                            tabs=[t.id for t in self.tabs],
                         )
-                        self.commit()
+                        self.saw_tab_event = True
+                        if ev.ctrl:
+                            self.ctrl_down = True
+                        self._move(-1 if ev.shift else 1)
+                        log(
+                            "tab_move",
+                            event_type=ev.event_type,
+                            selected_index=self.selected_index,
+                            selected_tab=self._current_tab_id(),
+                        )
+                        log("move", selected=self.selected_index)
+                        self.draw(force=True)
+                        self._schedule_preview_fetch()
+                        continue
+                    # Legacy shift-tab
+                    if ev.key_code == -TAB_CODE:
+                        self.saw_tab_event = True
+                        self._move(-1)
+                        log("move", selected=self.selected_index)
+                        self.draw(force=True)
+                        self._schedule_preview_fetch()
+                        continue
+                    if ev.key_code == ord("q") and ev.event_type == 1:
+                        log("quit_q")
+                        self.cancel()
                         return
-                    log("ctrl_release_ignored", elapsed=time.time() - self.start_time, saw_tab=self.saw_tab_event)
-                if ev.key_code == ESC_CODE and ev.event_type == 1:
-                    self.cancel()
-                    return
-                if ev.key_code == TAB_CODE and ev.event_type in (1, 2):
-                    log(
-                        "tab_key",
-                        event_type=ev.event_type,
-                        mods=ev.mods,
-                        ctrl=ev.ctrl,
-                        shift=ev.shift,
-                        selected_index=self.selected_index,
-                        selected_tab=self._current_tab_id(),
-                    )
-                    self.saw_tab_event = True
-                    if ev.ctrl:
-                        self.ctrl_down = True
-                    self._move(-1 if ev.shift else 1)
-                    log(
-                        "tab_move",
-                        event_type=ev.event_type,
-                        selected_index=self.selected_index,
-                        selected_tab=self._current_tab_id(),
-                    )
-                    log("move", selected=self.selected_index)
-                    self.draw(force=True)
-                    self._schedule_preview_fetch()
-                    continue
-                # Legacy shift-tab
-                if ev.key_code == -TAB_CODE:
-                    self.saw_tab_event = True
-                    self._move(-1)
-                    log("move", selected=self.selected_index)
-                    self.draw(force=True)
-                    self._schedule_preview_fetch()
-                    continue
-                if ev.key_code == ord("q") and ev.event_type == 1:
-                    log("quit_q")
-                    self.cancel()
-                    return
             except Exception as exc:
                 log("loop_exception", error=repr(exc))
                 log("loop_traceback", trace=traceback.format_exc())
@@ -415,62 +441,67 @@ class RawSwitcher:
         now = time.time()
         if not force and now - self.last_draw < 0.016:
             return
-        self.last_draw = now
-        rows, cols = screen_size()
-        log("draw", rows=rows, cols=cols, tabs=len(self.tabs), selected=self.selected_index)
-        write("\x1b[?25l")
-        write("\x1b[2J\x1b[H")
-        if debug_enabled():
-            write(f"\x1b[1;1H[DEBUG] size={rows}x{cols}")
-        if not self.tabs:
-            write("\x1b[HNo tabs")
+        with self.profiler.scoped("draw.total"):
+            self.last_draw = now
+            rows, cols = screen_size()
+            log("draw", rows=rows, cols=cols, tabs=len(self.tabs), selected=self.selected_index)
+            write("\x1b[?25l")
+            write("\x1b[2J\x1b[H")
+            if debug_enabled():
+                write(f"\x1b[1;1H[DEBUG] size={rows}x{cols}")
+            if not self.tabs:
+                write("\x1b[HNo tabs")
+                flush()
+                return
+
+            layout = self._compute_layout(rows, cols)
+            cards = self._visible_cards(layout["max_cards"])
+            card_w = layout["card_w"]
+            card_h = layout["card_h"]
+            total_w = len(cards) * card_w + (len(cards) - 1) * 2
+            if self.theme.align == "left":
+                start_x = 1
+            elif self.theme.align == "right":
+                start_x = max(1, cols - total_w + 1)
+            else:
+                start_x = max(1, (cols - total_w) // 2 + 1)
+            if self.theme.vertical_align == "top":
+                start_y = 1
+            elif self.theme.vertical_align == "bottom":
+                start_y = max(1, rows - card_h + 1)
+            else:
+                start_y = max(1, (rows - card_h) // 2 + 1)
+
+            for idx, tab in enumerate(cards):
+                x = start_x + idx * (card_w + 2)
+                y = start_y
+                selected = self._current_tab_id() == tab.id
+                if self._preview_stale(tab.id):
+                    if not hasattr(self, "preview_queue"):
+                        self.preview_queue = []
+                    if tab.id not in self.preview_queue:
+                        self.preview_queue.append(tab.id)
+                log("card", idx=idx, tab_id=tab.id, title=tab.title, x=x, y=y, selected=selected)
+                self._draw_card(x, y, card_w, card_h, tab, selected, rows, cols, layout)
+
+            write("\x1b[?25l")
             flush()
-            return
-
-        layout = self._compute_layout(rows, cols)
-        cards = self._visible_cards(layout["max_cards"])
-        card_w = layout["card_w"]
-        card_h = layout["card_h"]
-        total_w = len(cards) * card_w + (len(cards) - 1) * 2
-        if self.theme.align == "left":
-            start_x = 1
-        elif self.theme.align == "right":
-            start_x = max(1, cols - total_w + 1)
-        else:
-            start_x = max(1, (cols - total_w) // 2 + 1)
-        if self.theme.vertical_align == "top":
-            start_y = 1
-        elif self.theme.vertical_align == "bottom":
-            start_y = max(1, rows - card_h + 1)
-        else:
-            start_y = max(1, (rows - card_h) // 2 + 1)
-
-        for idx, tab in enumerate(cards):
-            x = start_x + idx * (card_w + 2)
-            y = start_y
-            selected = self._current_tab_id() == tab.id
-            if self._preview_stale(tab.id):
-                if not hasattr(self, "preview_queue"):
-                    self.preview_queue = []
-                if tab.id not in self.preview_queue:
-                    self.preview_queue.append(tab.id)
-            log("card", idx=idx, tab_id=tab.id, title=tab.title, x=x, y=y, selected=selected)
-            self._draw_card(x, y, card_w, card_h, tab, selected, rows, cols, layout)
-
-        write("\x1b[?25l")
-        flush()
 
     def commit(self) -> None:
         tab_id = self._current_tab_id()
         if tab_id is None:
             self.cancel()
             return
-        self._restore_layout()
+        self._maybe_flush_preview_state(force=True)
         log("commit", tab_id=tab_id)
         self._update_mru(tab_id)
         self._focus_tab(tab_id)
+        # Restore the source tab layout after switching focus so the user
+        # does not see a visible "snap back" in the current view.
+        self._restore_layout()
 
     def cancel(self) -> None:
+        self._maybe_flush_preview_state(force=True)
         self._restore_layout()
         return
 
@@ -513,26 +544,31 @@ class RawSwitcher:
         match_candidates = [f"id:{tab_id}", f"tab_id:{tab_id}", f"tab-id:{tab_id}"]
         last_cp = None
         for match_expr in match_candidates:
-            cp = self.remote_control(
-                [
-                    "goto-layout",
-                    "--match",
-                    match_expr,
-                    layout,
-                ],
-                capture_output=True,
-            )
-            last_cp = cp
-            rc = getattr(cp, "returncode", 0)
-            out = getattr(cp, "stdout", b"")
-            err = getattr(cp, "stderr", b"")
-            if isinstance(out, bytes):
-                out = out.decode("utf-8", "replace")
-            if isinstance(err, bytes):
-                err = err.decode("utf-8", "replace")
-            log("layout_set_result", tab_id=tab_id, layout=layout, match=match_expr, returncode=rc, stdout=out, stderr=err)
-            if rc in (0, None):
-                return
+            for cmd in (
+                ["goto-layout", "--match", match_expr, layout],
+                ["action", "--match", match_expr, f"goto_layout {layout}"],
+            ):
+                cp = self.remote_control(cmd, capture_output=True)
+                last_cp = cp
+                rc = getattr(cp, "returncode", 0)
+                out = getattr(cp, "stdout", b"")
+                err = getattr(cp, "stderr", b"")
+                if isinstance(out, bytes):
+                    out = out.decode("utf-8", "replace")
+                if isinstance(err, bytes):
+                    err = err.decode("utf-8", "replace")
+                log(
+                    "layout_set_result",
+                    tab_id=tab_id,
+                    layout=layout,
+                    match=match_expr,
+                    cmd=" ".join(cmd),
+                    returncode=rc,
+                    stdout=out,
+                    stderr=err,
+                )
+                if rc in (0, None):
+                    return
         if last_cp is not None:
             rc = getattr(last_cp, "returncode", 0)
             log("layout_set_failed", tab_id=tab_id, layout=layout, returncode=rc)
@@ -588,12 +624,25 @@ class RawSwitcher:
 
         if not layout["title_only"]:
             raw_lines = self.preview_cache.get(tab.id) or []
-            preview = render_block_preview(
-                raw_lines,
+            cache_key = (
+                tab.id,
                 layout["preview_cols"],
                 layout["preview_rows"],
-                color_mode=self.theme.preview_color_mode,
+                self.theme.preview_color_mode,
+                hash("\n".join(raw_lines)),
             )
+            preview = self.render_cache.get(cache_key)
+            if preview is None:
+                with self.profiler.scoped("preview.render.block"):
+                    preview = render_block_preview(
+                        raw_lines,
+                        layout["preview_cols"],
+                        layout["preview_rows"],
+                        color_mode=self.theme.preview_color_mode,
+                    )
+                self.render_cache[cache_key] = preview
+                if len(self.render_cache) > 512:
+                    self.render_cache.clear()
             for r, line in enumerate(preview[: layout["preview_rows"]]):
                 write_at(y + 3 + r, x + 3, self._wrap_preview_line(line, layout["preview_cols"]), False)
 
@@ -807,7 +856,8 @@ class RawSwitcher:
                 log("preview_fetch", tab_id=tab.id, window_id=tab.window_id)
                 self.preview_cache[tab.id] = self._fetch_preview(tab)
                 self.preview_cache_ts[tab.id] = time.time()
-                self.preview_state.save(self.preview_cache, self.preview_cache_ts)
+                self.preview_dirty = True
+                self._maybe_flush_preview_state(force=False)
 
     def _schedule_preview_fetch(self) -> None:
         if not self.tabs:
@@ -831,25 +881,33 @@ class RawSwitcher:
         if tab_id not in self.preview_cache:
             return True
         ts = self.preview_cache_ts.get(tab_id, 0.0)
-        return (time.time() - ts) >= PREVIEW_REFRESH_SECS
+        return (time.time() - ts) >= self.preview_refresh_secs
 
     def _drain_preview_queue(self) -> bool:
         queue = getattr(self, "preview_queue", [])
         if not queue:
             return False
+        now = time.time()
+        if (now - self.last_preview_fetch) < self.preview_fetch_budget_secs:
+            self._maybe_flush_preview_state(force=False)
+            return False
         tab_id = queue.pop(0)
         tab = self._tab_by_id(tab_id)
         if tab is not None and self._preview_stale(tab.id):
             log("preview_refresh", tab_id=tab.id, window_id=tab.window_id)
+            self.last_preview_fetch = now
             self.preview_cache[tab.id] = self._fetch_preview(tab)
             self.preview_cache_ts[tab.id] = time.time()
-            self.preview_state.save(self.preview_cache, self.preview_cache_ts)
+            self.preview_dirty = True
+            self._maybe_flush_preview_state(force=False)
             return True
+        self._maybe_flush_preview_state(force=False)
         return False
 
     def _fetch_preview(self, tab: TabInfo) -> list[str]:
         try:
-            lines = get_text_lines_from_rc(self.remote_control, tab.window_id, ansi=True)
+            with self.profiler.scoped("preview.fetch.remote"):
+                lines = get_text_lines_from_rc(self.remote_control, tab.window_id, ansi=True)
             if not lines:
                 log("preview_error", tab_id=tab.id, returncode=1)
                 return [" " * PREVIEW_COLS] * PREVIEW_ROWS
@@ -858,6 +916,17 @@ class RawSwitcher:
             return [" " * PREVIEW_COLS] * PREVIEW_ROWS
         log("preview_lines", tab_id=tab.id, lines=len(lines))
         return lines
+
+    def _maybe_flush_preview_state(self, force: bool) -> None:
+        if not self.preview_dirty:
+            return
+        now = time.time()
+        if not force and (now - self.last_preview_save) < self.preview_save_interval:
+            return
+        with self.profiler.scoped("cache.save.preview"):
+            self.preview_state.save(self.preview_cache, self.preview_cache_ts)
+        self.preview_dirty = False
+        self.last_preview_save = now
 
     def _focus_tab(self, tab_id: int) -> None:
         self.remote_control(
@@ -880,7 +949,8 @@ class RawSwitcher:
         now = time.time()
         self.last_used = {tid: now - (idx * 0.001) for idx, tid in enumerate(self.mru_order)}
         log("mru_commit", ordered=self.mru_order, committed=tab_id, original=self.original_tab_id)
-        self.state.save(self.last_used)
+        with self.profiler.scoped("cache.save.state"):
+            self.state.save(self.last_used)
 
     def _send_marker(self) -> None:
         try:
@@ -915,9 +985,10 @@ class RawSwitcher:
         log("initial_mods", mods=mods, ctrl_down=self.initial_ctrl_down)
 
 
-def _parse_switcher_args(args: list[str]) -> tuple[int, str | None]:
+def _parse_switcher_args(args: list[str]) -> tuple[int, str | None, bool]:
     direction = 1
     theme_path: str | None = None
+    profile = False
     it = iter(args)
     for raw in it:
         arg = raw.strip()
@@ -934,16 +1005,21 @@ def _parse_switcher_args(args: list[str]) -> tuple[int, str | None]:
         if low == "--theme":
             theme_path = next(it, None)
             continue
-    return direction, theme_path
+        if low == "--profile":
+            profile = True
+            continue
+    return direction, theme_path, profile
 
 
 @kitten_ui(allow_remote_control=True)
 def main(args: list[str]) -> str:
-    direction, theme_path = _parse_switcher_args(args)
+    direction, theme_path, profile_flag = _parse_switcher_args(args)
     if theme_path is None:
         theme_path = os.environ.get(THEME_ENV_VAR)
     theme = load_theme(theme_path)
     log("theme_loaded", path=theme_path, name=theme.name)
+    sample_ms = int(os.environ.get(PROFILE_SAMPLE_MS_ENV, "100") or "100")
+    profiler = SectionProfiler(enabled=(profile_flag or profile_enabled()), sample_ms=sample_ms)
     rc = main.remote_control
     os_window_id, tabs = list_tabs(rc)
     if not tabs:
@@ -954,7 +1030,7 @@ def main(args: list[str]) -> str:
         return ""
     mru = StateStore(os_window_id).load()
     server = CommandServer(os_window_id)
-    switcher = RawSwitcher(tabs, mru, os_window_id, direction, rc, server, theme)
+    switcher = RawSwitcher(tabs, mru, os_window_id, direction, rc, server, theme, profiler)
     try:
         run_in_raw_mode(switcher)
     finally:
@@ -982,6 +1058,14 @@ def run_in_raw_mode(switcher: RawSwitcher) -> None:
         exit_keyboard_mode()
         exit_alternate_screen()
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        try:
+            switcher._maybe_flush_preview_state(force=True)
+        except Exception:
+            pass
+        try:
+            switcher.profiler.flush(snapshot=False)
+        except Exception:
+            pass
         log("raw_mode_exit")
         write("\x1b[?25h\x1b[0m")
         flush()
@@ -1319,6 +1403,90 @@ def debug_enabled() -> bool:
 
 def debug_path() -> str:
     return os.environ.get(DEBUG_PATH_ENV, DEFAULT_DEBUG_PATH)
+
+
+def profile_enabled() -> bool:
+    return os.environ.get(PROFILE_ENV, "").strip() not in {"", "0", "false", "False"}
+
+
+def profile_path() -> str:
+    default = os.path.expanduser("~/.cache/kitty-tab-switcher-profile.jsonl")
+    return os.environ.get(PROFILE_PATH_ENV, default)
+
+
+class SectionProfiler:
+    def __init__(self, enabled: bool, sample_ms: int = 100) -> None:
+        self.enabled = enabled
+        self.sample_ms = max(10, int(sample_ms))
+        self.samples: dict[str, list[float]] = {}
+        self.last_flush = time.time()
+        self.path = profile_path()
+
+    def start(self) -> float:
+        if not self.enabled:
+            return 0.0
+        return time.perf_counter()
+
+    def end(self, name: str, started: float) -> None:
+        if not self.enabled or started == 0.0:
+            return
+        ms = (time.perf_counter() - started) * 1000.0
+        self.samples.setdefault(name, []).append(ms)
+        now = time.time()
+        if (now - self.last_flush) * 1000.0 >= self.sample_ms:
+            self.flush(snapshot=True)
+            self.last_flush = now
+
+    def scoped(self, name: str) -> "_ProfileScope":
+        return _ProfileScope(self, name)
+
+    def _summarize(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for name, vals in self.samples.items():
+            if not vals:
+                continue
+            s = sorted(vals)
+            n = len(s)
+            p50 = s[int((n - 1) * 0.50)]
+            p95 = s[int((n - 1) * 0.95)]
+            out[name] = {
+                "count": n,
+                "total_ms": round(sum(s), 3),
+                "avg_ms": round(sum(s) / n, 3),
+                "p50_ms": round(p50, 3),
+                "p95_ms": round(p95, 3),
+                "max_ms": round(s[-1], 3),
+            }
+        return out
+
+    def flush(self, snapshot: bool = False) -> None:
+        if not self.enabled:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            payload = {
+                "ts": time.time(),
+                "type": "snapshot" if snapshot else "final",
+                "sections": self._summarize(),
+            }
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, sort_keys=True) + "\n")
+        except Exception:
+            pass
+
+
+class _ProfileScope:
+    def __init__(self, profiler: SectionProfiler, name: str) -> None:
+        self.profiler = profiler
+        self.name = name
+        self.started = 0.0
+
+    def __enter__(self) -> "_ProfileScope":
+        self.started = self.profiler.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.profiler.end(self.name, self.started)
 
 
 def log(message: str, **fields: Any) -> None:

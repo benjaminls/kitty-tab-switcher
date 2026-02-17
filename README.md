@@ -71,6 +71,28 @@ Behavior options:
 
 - `behavior.zoom_on_open`: When true, temporarily sets the active tab's layout to `stack` while the switcher is open, then restores the previous layout before switching tabs.
 
+Performance options:
+
+- `performance.preview_refresh_ms`: staleness threshold before preview refresh.
+- `performance.preview_fetch_budget_ms`: minimum spacing between queued preview fetches.
+- `performance.mod_poll_fast_ms`: modifier poll interval during active interaction.
+- `performance.mod_poll_idle_ms`: modifier poll interval while idle.
+
+Profiling:
+
+- Set `KTS_PROFILE=1` to enable profiling.
+- Optional: `KTS_PROFILE_PATH=/path/to/profile.jsonl`
+- Optional: `KTS_PROFILE_SAMPLE_MS=100`
+- Or pass `--profile` to the kitten args.
+
+Profiler report helper:
+
+```bash
+python profile_report.py
+python profile_report.py ~/.cache/kitty-tab-switcher-profile.jsonl --top 15
+python profile_report.py --json
+```
+
 ## Preview Debugging
 
 You can debug the preview generation independently:

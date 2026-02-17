@@ -38,6 +38,10 @@ class Theme:
     card_min_height: int = 3
     preview_color_mode: str = "both"  # none|fg|bg|both
     zoom_on_open: bool = False
+    preview_refresh_ms: int = 500
+    preview_fetch_budget_ms: int = 40
+    mod_poll_fast_ms: int = 20
+    mod_poll_idle_ms: int = 100
 
 
 def _coerce_value(value: str) -> Any:
@@ -159,5 +163,12 @@ def load_theme(path: Optional[str]) -> Theme:
         elif "stack_on_open" in behavior:
             # backward compatibility
             theme.zoom_on_open = bool(behavior.get("stack_on_open", theme.zoom_on_open))
+
+    perf = data.get("performance", {})
+    if isinstance(perf, dict):
+        theme.preview_refresh_ms = int(perf.get("preview_refresh_ms", theme.preview_refresh_ms))
+        theme.preview_fetch_budget_ms = int(perf.get("preview_fetch_budget_ms", theme.preview_fetch_budget_ms))
+        theme.mod_poll_fast_ms = int(perf.get("mod_poll_fast_ms", theme.mod_poll_fast_ms))
+        theme.mod_poll_idle_ms = int(perf.get("mod_poll_idle_ms", theme.mod_poll_idle_ms))
 
     return theme

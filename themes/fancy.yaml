@@ -43,3 +43,9 @@ preview:
 
 behavior:
   zoom_on_open: true
+
+performance:
+  preview_refresh_ms: 500
+  preview_fetch_budget_ms: 40
+  mod_poll_fast_ms: 20
+  mod_poll_idle_ms: 100
