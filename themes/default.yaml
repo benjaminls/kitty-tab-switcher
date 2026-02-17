@@ -40,3 +40,6 @@ size:
 
 preview:
   color_mode: both
+
+behavior:
+  zoom_on_open: true

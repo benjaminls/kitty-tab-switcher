@@ -61,12 +61,14 @@ class TabInfo:
         title: str,
         window_id: int,
         is_active: bool,
+        layout: str | None = None,
         last_focused: float | None = None,
     ) -> None:
         self.id = id
         self.title = title
         self.window_id = window_id
         self.is_active = is_active
+        self.layout = layout
         self.last_focused = last_focused
 
 
@@ -234,6 +236,9 @@ class RawSwitcher:
         cached, cached_ts = self.preview_state.load()
         self.preview_cache.update(cached)
         self.preview_cache_ts.update(cached_ts)
+        self.layout_restore_tab_id: int | None = None
+        self.layout_restore_name: str | None = None
+        self.layout_changed = False
         self.last_used = self._reconcile_mru(mru)
         self.original_tab_id = self._active_tab_id()
         if self.original_tab_id is not None:
@@ -267,6 +272,7 @@ class RawSwitcher:
 
     def run(self) -> None:
         log("switcher.run start", tabs=len(self.tabs), selected=self.selected_index)
+        self._maybe_stack_active_tab()
         self._send_marker()
         self._check_initial_mods()
         self.draw()
@@ -459,12 +465,77 @@ class RawSwitcher:
         if tab_id is None:
             self.cancel()
             return
+        self._restore_layout()
         log("commit", tab_id=tab_id)
         self._update_mru(tab_id)
         self._focus_tab(tab_id)
 
     def cancel(self) -> None:
+        self._restore_layout()
         return
+
+    def _maybe_stack_active_tab(self) -> None:
+        if not self.theme.zoom_on_open:
+            return
+        active_id = self._active_tab_id()
+        if active_id is None:
+            return
+        active_tab = self._tab_by_id(active_id)
+        if active_tab is None:
+            return
+        layout = getattr(active_tab, "layout", None)
+        if not layout or layout == "stack":
+            return
+        try:
+            self._set_tab_layout(active_id, "stack")
+            self.layout_restore_tab_id = active_id
+            self.layout_restore_name = str(layout)
+            self.layout_changed = True
+            log("layout_stack", tab_id=active_id, previous=layout)
+        except Exception as exc:
+            log("layout_stack_error", tab_id=active_id, error=repr(exc))
+
+    def _restore_layout(self) -> None:
+        if not self.layout_changed or self.layout_restore_tab_id is None or not self.layout_restore_name:
+            return
+        try:
+            self._set_tab_layout(self.layout_restore_tab_id, self.layout_restore_name)
+            log("layout_restore", tab_id=self.layout_restore_tab_id, layout=self.layout_restore_name)
+        except Exception as exc:
+            log("layout_restore_error", tab_id=self.layout_restore_tab_id, error=repr(exc))
+        finally:
+            self.layout_changed = False
+
+    def _set_tab_layout(self, tab_id: int, layout: str) -> None:
+        if self.remote_control is None:
+            log("layout_set_skip", reason="no_remote_control", tab_id=tab_id, layout=layout)
+            return
+        match_candidates = [f"id:{tab_id}", f"tab_id:{tab_id}", f"tab-id:{tab_id}"]
+        last_cp = None
+        for match_expr in match_candidates:
+            cp = self.remote_control(
+                [
+                    "goto-layout",
+                    "--match",
+                    match_expr,
+                    layout,
+                ],
+                capture_output=True,
+            )
+            last_cp = cp
+            rc = getattr(cp, "returncode", 0)
+            out = getattr(cp, "stdout", b"")
+            err = getattr(cp, "stderr", b"")
+            if isinstance(out, bytes):
+                out = out.decode("utf-8", "replace")
+            if isinstance(err, bytes):
+                err = err.decode("utf-8", "replace")
+            log("layout_set_result", tab_id=tab_id, layout=layout, match=match_expr, returncode=rc, stdout=out, stderr=err)
+            if rc in (0, None):
+                return
+        if last_cp is not None:
+            rc = getattr(last_cp, "returncode", 0)
+            log("layout_set_failed", tab_id=tab_id, layout=layout, returncode=rc)
 
     def _visible_cards(self, max_cards: int) -> list[TabInfo]:
         if len(self.tabs) <= max_cards:
@@ -1179,6 +1250,7 @@ def parse_tabs(
                 title=title,
                 window_id=window_id,
                 is_active=is_active,
+                layout=tab.get("layout"),
                 last_focused=last_focused,
             )
         )

@@ -63,6 +63,10 @@ export KTS_THEME=/path/to/theme.yaml
 
 A sample theme is in `themes/default.yaml`.
 
+Behavior options:
+
+- `behavior.zoom_on_open`: When true, temporarily sets the active tab's layout to `stack` while the switcher is open, then restores the previous layout before switching tabs.
+
 ## Preview Debugging
 
 You can debug the preview generation independently:

@@ -37,6 +37,7 @@ class Theme:
     card_min_width: int = 7
     card_min_height: int = 3
     preview_color_mode: str = "both"  # none|fg|bg|both
+    zoom_on_open: bool = False
 
 
 def _coerce_value(value: str) -> Any:
@@ -150,5 +151,13 @@ def load_theme(path: Optional[str]) -> Theme:
     preview = data.get("preview", {})
     if isinstance(preview, dict):
         theme.preview_color_mode = str(preview.get("color_mode", theme.preview_color_mode))
+
+    behavior = data.get("behavior", {})
+    if isinstance(behavior, dict):
+        if "zoom_on_open" in behavior:
+            theme.zoom_on_open = bool(behavior.get("zoom_on_open", theme.zoom_on_open))
+        elif "stack_on_open" in behavior:
+            # backward compatibility
+            theme.zoom_on_open = bool(behavior.get("stack_on_open", theme.zoom_on_open))
 
     return theme
