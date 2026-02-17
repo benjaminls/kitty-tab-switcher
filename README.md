@@ -6,7 +6,8 @@ A fast, Mac/Orion-style tab switcher kitten for kitty. It opens an overlay in th
 
 ## Install
 
-Copy `tab_switcher.py` into your kitty config directory (or keep it in this repo and reference it by path).
+1) Copy this git repository into your kitty config directory. Often `~/.config/kitty`.
+2) Add keybindings to `kitty.conf` (see below)
 
 ## Keybindings
 
@@ -18,6 +19,9 @@ map ctrl+shift+tab kitten /path/to/tab_switcher.py prev
 map --when-focus-on title:^KTS_SWITCHER$ ctrl+tab send_key tab
 map --when-focus-on title:^KTS_SWITCHER$ ctrl+shift+tab send_key shift+tab
 ```
+
+By default it uses the theme `themes/default.yaml`, but this is configurable (see below).
+
 
 ## Behavior
 
@@ -130,3 +134,5 @@ python preview_image.py --listen-on "$KITTY_LISTEN_ON" --out /tmp/preview.png
 ```
 
 Note: This requires Pillow (`pip install pillow`).
+
+For image-based preview, consider explicitly specifying a font with `--font path/to/font.ttf` in the commands in `kitty.conf`. This is especially helpful if you use Powerline or Nerd Fonts.
